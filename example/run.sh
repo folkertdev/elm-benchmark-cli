@@ -1,3 +1,3 @@
 #!/bin/bash
 
-elm-make --yes Main.elm --output elm.js >/dev/null && node run.js
+elm make Main.elm --output elm.js >/dev/null && node run.js

@@ -1,6 +1,6 @@
 const Elm = require('./elm.js');
 
-const app = Elm.Main.worker();
+const app = Elm.Elm.Main.init();
 
 app.ports.emit.subscribe(function(v) {
     switch (v.type) {

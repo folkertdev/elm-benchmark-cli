@@ -1,109 +1,95 @@
-module Benchmark.Runner.Node exposing (Benchmark, BenchmarkProgram, compare, group, run, series, single)
+module Benchmark.Runner.Node exposing (Benchmark, BenchmarkProgram, run)
 
-import Benchmark.LowLevel as LowLevel
+import Benchmark
+import Benchmark.LowLevel
+import Benchmark.Reporting as Reporting
+import Benchmark.Status as Status
 import Console
 import Dict exposing (Dict)
 import Json.Encode exposing (Value)
-import Platform exposing (program)
+import Platform exposing (worker)
 import Process
 import Task exposing (Task)
+import Trend.Linear as Trend exposing (Trend)
+import Trend.Math
 
 
-single : LowLevel.Benchmark -> Benchmark
-single =
-    Single
+fromLowLevel : Benchmark.Benchmark -> Benchmark
+fromLowLevel lowlevel =
+    case Reporting.fromBenchmark lowlevel of
+        Reporting.Single name _ ->
+            Wrapped name lowlevel
 
+        Reporting.Series name _ ->
+            Wrapped name lowlevel
 
-group : String -> List Benchmark -> Benchmark
-group =
-    Group
-
-
-compare : List LowLevel.Benchmark -> Benchmark
-compare benches =
-    case benches of
-        x :: y :: xs ->
-            Compare x (y :: xs)
-
-        _ ->
-            Debug.crash "you need to provide at least two benchmarks to compare"
-
-
-series : String -> (a -> String) -> (a -> Benchmark) -> List a -> Benchmark
-series name toDescription toBenchmark cases =
-    List.map (\aCase -> ( toDescription aCase, toBenchmark aCase )) cases
-        |> Dict.fromList
-        |> Series name
+        Reporting.Group name _ ->
+            Wrapped name lowlevel
 
 
 type Benchmark
-    = Single LowLevel.Benchmark
-    | Compare LowLevel.Benchmark (List LowLevel.Benchmark)
+    = Compare Benchmark.Benchmark (List Benchmark.Benchmark)
     | Group String (List Benchmark)
     | Series String (Dict String Benchmark)
+    | Wrapped String Benchmark.Benchmark
 
 
-maybeTaskList :
-    (a -> Maybe (Task e a))
+isDone : Benchmark -> Bool
+isDone benchmark =
+    case benchmark of
+        Wrapped _ lowlevel ->
+            Benchmark.done lowlevel
+
+        Compare base other ->
+            Benchmark.done base && List.all Benchmark.done other
+
+        Group _ other ->
+            List.all isDone other
+
+        Series _ samples ->
+            samples
+                |> Dict.values
+                |> List.all isDone
+
+
+traverse :
+    (a -> Task e a)
     -> List a
-    -> Maybe (Task e (List a))
-maybeTaskList toMaybeTask list =
-    let
-        tasks =
-            List.map toMaybeTask list
-    in
-    if List.all ((==) Nothing) tasks then
-        Nothing
-    else
-        List.map2
-            (\maybeTask original ->
-                Maybe.withDefault (Task.succeed original) maybeTask
-            )
-            tasks
-            list
-            |> Task.sequence
-            |> Just
+    -> Task e (List a)
+traverse toTask list =
+    list
+        |> List.map toTask
+        |> Task.sequence
 
 
-step : Benchmark -> Maybe (Task Never Benchmark)
+step : Benchmark -> Task Never Benchmark
 step structure =
     case structure of
-        Single bench ->
-            LowLevel.step bench |> Maybe.map (Task.map Single)
+        Wrapped name bench ->
+            Task.map (Wrapped name) (Benchmark.step bench)
 
         Compare baseline cases ->
-            case ( LowLevel.step baseline, maybeTaskList LowLevel.step cases ) of
-                ( Nothing, Nothing ) ->
-                    Nothing
-
+            case ( Benchmark.step baseline, traverse Benchmark.step cases ) of
                 ( left, right ) ->
-                    Task.map2 Compare
-                        (Maybe.withDefault (Task.succeed baseline) left)
-                        (Maybe.withDefault (Task.succeed cases) right)
-                        |> Just
+                    Task.map2 Compare left right
 
         Group name entries ->
-            case maybeTaskList step entries of
-                Nothing ->
-                    Nothing
-
-                Just tasks ->
-                    Task.map (Group name) tasks |> Just
+            Task.map (Group name) (traverse step entries)
 
         Series name entries ->
             let
                 tasks =
                     Dict.toList entries
-                        |> List.filterMap
+                        |> List.map
                             (\( key, entry ) ->
                                 entry
                                     |> step
-                                    |> Maybe.map (Task.map ((,) key))
+                                    |> Task.map (Tuple.pair key)
                             )
             in
             case tasks of
                 [] ->
-                    Nothing
+                    Task.succeed (Series name Dict.empty)
 
                 _ ->
                     List.foldr
@@ -115,7 +101,6 @@ step structure =
                         (Task.succeed entries)
                         tasks
                         |> Task.map (Series name)
-                        |> Just
 
 
 type alias Model =
@@ -125,7 +110,7 @@ type alias Model =
 
 
 type alias BenchmarkProgram =
-    Program Never Model Msg
+    Program () Model Msg
 
 
 type Msg
@@ -134,13 +119,19 @@ type Msg
 
 init : (Value -> Cmd Msg) -> Benchmark -> ( Model, Cmd Msg )
 init emit benchmarks =
-    { emit = emit
-    , benchmarks = benchmarks
-    }
-        ! [ stepCmd benchmarks |> Maybe.withDefault Cmd.none
-          , emit <| running benchmarks
-          , emit <| start benchmarks
-          ]
+    ( { emit = emit
+      , benchmarks = benchmarks
+      }
+    , Cmd.batch
+        [ if isDone benchmarks then
+            Cmd.none
+
+          else
+            stepCmd benchmarks
+        , emit <| running benchmarks
+        , emit <| start benchmarks
+        ]
+    )
 
 
 breakForRender : Task x a -> Task x a
@@ -148,21 +139,20 @@ breakForRender task =
     Process.sleep 0 |> Task.andThen (always task)
 
 
-stepCmd : Benchmark -> Maybe (Cmd Msg)
+stepCmd : Benchmark -> Cmd Msg
 stepCmd benchmark =
     step benchmark
-        |> Maybe.map breakForRender
-        |> Maybe.map (Task.perform Update)
+        |> breakForRender
+        |> Task.perform Update
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update (Update benchmark) ({ emit } as model) =
-    case stepCmd benchmark of
-        Just cmd ->
-            { model | benchmarks = benchmark } ! [ cmd, emit <| running benchmark ]
+    if isDone benchmark then
+        ( { model | benchmarks = benchmark }, Cmd.batch [ emit <| done benchmark ] )
 
-        Nothing ->
-            { model | benchmarks = benchmark } ! [ emit <| done benchmark ]
+    else
+        ( { model | benchmarks = benchmark }, Cmd.batch [ stepCmd benchmark, emit <| running benchmark ] )
 
 
 type Progress
@@ -172,7 +162,7 @@ type Progress
 
 
 type alias ProgressStats =
-    { current : Float, total : Float, errors : Int }
+    { progress : Float, errors : Int }
 
 
 combine :
@@ -183,8 +173,7 @@ combine left right =
     case ( left, right ) of
         ( InProgress a, InProgress b ) ->
             InProgress
-                { current = a.current + b.current
-                , total = a.total + b.total
+                { progress = max a.progress b.progress
                 , errors = a.errors + b.errors
                 }
 
@@ -198,69 +187,101 @@ combine left right =
             Sizing
 
 
-stats : Benchmark -> Progress
-stats structure =
+getNameLowlevel : Benchmark.Benchmark -> String
+getNameLowlevel lowlevel =
+    case Reporting.fromBenchmark lowlevel of
+        Reporting.Single name _ ->
+            name
+
+        _ ->
+            Debug.todo "should not happen?"
+
+
+getProgressLowlevel : Benchmark.Benchmark -> Status.Status
+getProgressLowlevel lowlevel =
+    case Reporting.fromBenchmark lowlevel of
+        Reporting.Single _ status ->
+            status
+
+        Reporting.Series _ namedStatuses ->
+            List.head namedStatuses
+                |> Maybe.map Tuple.second
+                |> Maybe.withDefault Status.Cold
+
+        Reporting.Group _ _ ->
+            Debug.todo "should not happen?"
+
+
+getProgress : Benchmark -> Progress
+getProgress structure =
     case structure of
-        Single bench ->
-            LowLevel.status bench |> statusToStats
+        Wrapped _ bench ->
+            getProgressLowlevel bench
+                |> statusToStats
 
         Compare baseLine cases ->
             List.foldr combine
-                (LowLevel.status baseLine |> statusToStats)
-                (List.map (LowLevel.status >> statusToStats) cases)
+                (getProgressLowlevel baseLine |> statusToStats)
+                (List.map (getProgressLowlevel >> statusToStats) cases)
 
-        Group _ reports ->
-            List.foldr
-                (\report acc_ ->
-                    case acc_ of
-                        Nothing ->
-                            Just <| stats report
-
-                        Just acc ->
-                            Just <| combine acc (stats report)
-                )
-                Nothing
-                reports
-                |> Maybe.withDefault Invalid
-
-        Series name entries ->
-            Dict.foldl
-                (\_ report acc_ ->
-                    case acc_ of
-                        Nothing ->
-                            Just <| stats report
-
-                        Just acc ->
-                            Just <| combine acc (stats report)
-                )
-                Nothing
-                entries
-                |> Maybe.withDefault Invalid
+        _ ->
+            Debug.todo "not implemented"
 
 
-statusToStats : LowLevel.Status -> Progress
+
+{-
+   Compare baseLine cases ->
+       List.foldr combine
+           (LowLevel.status baseLine |> statusToStats)
+           (List.map (LowLevel.status >> statusToStats) cases)
+
+   Group _ reports ->
+       List.foldr
+           (\report acc_ ->
+               case acc_ of
+                   Nothing ->
+                       Just <| getProgress report
+
+                   Just acc ->
+                       Just <| combine acc (getProgress report)
+           )
+           Nothing
+           reports
+           |> Maybe.withDefault Invalid
+
+   Series name entries ->
+       Dict.foldl
+           (\_ report acc_ ->
+               case acc_ of
+                   Nothing ->
+                       Just <| getProgress report
+
+                   Just acc ->
+                       Just <| combine acc (getProgress report)
+           )
+           Nothing
+           entries
+           |> Maybe.withDefault Invalid
+-}
+
+
+statusToStats : Status.Status -> Progress
 statusToStats status =
     case status of
-        LowLevel.ToSize total ->
+        Status.Cold ->
             Sizing
 
-        LowLevel.Pending total _ samples ->
-            InProgress
-                { current = min total (List.sum samples)
-                , total = total
-                , errors = 0
-                }
+        Status.Unsized ->
+            Sizing
 
-        LowLevel.Failure _ ->
-            InProgress { current = 0, total = 0, errors = 1 }
+        Status.Pending total samples ->
+            InProgress { progress = Status.progress status, errors = 0 }
 
-        LowLevel.Success _ samples ->
-            let
-                total : Float
-                total =
-                    List.sum samples
-            in
-            InProgress { current = total, total = total, errors = 0 }
+        Status.Failure _ ->
+            InProgress { progress = Status.progress status, errors = 1 }
+
+        Status.Success _ _ ->
+            InProgress { progress = Status.progress status, errors = 0 }
 
 
 running : Benchmark -> Value
@@ -268,7 +289,7 @@ running report =
     Json.Encode.object
         [ ( "type", Json.Encode.string "running" )
         , ( "data"
-          , Json.Encode.string <| "\x0D" ++ progressBar 72 (stats report)
+          , Json.Encode.string <| "\u{000D}" ++ progressBar 72 (getProgress report)
           )
         ]
 
@@ -282,37 +303,56 @@ progressBar width progress =
         Invalid ->
             "Invalid benchmark structure."
 
-        InProgress { current, total, errors } ->
+        InProgress inProgress ->
             let
-                done : Int
-                done =
-                    (current * 8 * toFloat width)
-                        / total
+                {-
+                   doneWhen : Int
+                   doneWhen =
+                       (current * 8 * toFloat width)
+                           / total
+                           |> floor
+
+                   toGo : Int
+                   toGo =
+                       width - ceiling (toFloat doneWhen / 8)
+
+                   percentDone : Int
+                   percentDone =
+                       (current * toFloat 100)
+                           / total
+                           |> floor
+                -}
+                doneWhen =
+                    inProgress.progress
+                        * 8
+                        * toFloat width
                         |> floor
 
-                toGo : Int
                 toGo =
-                    width - ceiling (toFloat done / 8)
+                    width - ceiling (toFloat doneWhen / 8)
 
                 percentDone : Int
                 percentDone =
-                    (current * toFloat 100)
-                        / total
+                    (inProgress.progress * toFloat 100)
                         |> floor
+
+                errors =
+                    inProgress.errors
 
                 error : String
                 error =
                     if errors > 0 then
-                        " " ++ toString errors ++ " errors"
+                        " " ++ Debug.toString errors ++ " errors"
+
                     else
                         ""
             in
             [ "▕"
-            , String.repeat (done // 8) "█"
-            , block (done % 8)
+            , String.repeat (doneWhen // 8) "█"
+            , block (doneWhen |> modBy 8)
             , String.repeat toGo "·"
             , "▏"
-            , String.padLeft 4 ' ' (toString percentDone ++ "%")
+            , String.padLeft 4 ' ' (Debug.toString percentDone ++ "%")
             , error
             ]
                 |> String.concat
@@ -353,7 +393,7 @@ done : Benchmark -> Value
 done report =
     Json.Encode.object
         [ ( "type", Json.Encode.string "done" )
-        , ( "msg", Json.Encode.string <| "\x0D" ++ progressBar 72 (stats report) )
+        , ( "msg", Json.Encode.string <| "\u{000D}" ++ progressBar 72 (getProgress report) )
         , ( "data", encode report |> Maybe.withDefault (Json.Encode.object []) )
         ]
 
@@ -384,16 +424,16 @@ makePrettyIntro =
 makePrettyIntroLines : Benchmark -> List String
 makePrettyIntroLines structure =
     case structure of
-        Single benchmark ->
-            [ LowLevel.name benchmark ]
+        Wrapped name benchmark ->
+            [ name ]
 
         Compare baseline cases ->
             "Compare:"
-                :: (("→ " ++ LowLevel.name baseline) |> indent 1)
-                :: List.map (LowLevel.name >> (++) "↝ " >> indent 1) cases
+                :: (("→ " ++ getNameLowlevel baseline) |> indent 1)
+                :: List.map (getNameLowlevel >> (++) "↝ " >> indent 1) cases
 
-        Group group reports ->
-            ("↳ " ++ group)
+        Group thisGroup reports ->
+            ("↳ " ++ thisGroup)
                 :: List.concatMap
                     (makePrettyIntroLines >> List.map (indent 1))
                     reports
@@ -402,8 +442,8 @@ makePrettyIntroLines structure =
             ("Series - " ++ name)
                 :: (Dict.toList variations
                         |> List.concatMap
-                            (\( name, variation ) ->
-                                ("Variation: " ++ name)
+                            (\( subname, variation ) ->
+                                ("Variation: " ++ subname)
                                     :: (variation |> makePrettyIntroLines |> List.map (indent 1))
                             )
                         |> List.map (indent 1)
@@ -413,14 +453,14 @@ makePrettyIntroLines structure =
 encode : Benchmark -> Maybe Value
 encode benchmark =
     case benchmark of
-        Single bench ->
+        Wrapped _ bench ->
             encodeBench bench
 
         Compare baseline cases ->
             Maybe.map
                 (\baseObject ->
                     [ ( "baseline", baseObject )
-                    , ( "cases", Json.Encode.list (List.filterMap encodeBench cases) )
+                    , ( "cases", Json.Encode.list identity (List.filterMap encodeBench cases) )
                     ]
                         |> Json.Encode.object
                 )
@@ -433,7 +473,7 @@ encode benchmark =
 
                 encodedMembers ->
                     [ ( "name", Json.Encode.string name )
-                    , ( "entries", Json.Encode.list encodedMembers )
+                    , ( "entries", Json.Encode.list identity encodedMembers )
                     ]
                         |> Json.Encode.object
                         |> Just
@@ -453,47 +493,91 @@ encode benchmark =
 
 mapTupleToMaybe : (b -> Maybe c) -> ( a, b ) -> Maybe ( a, c )
 mapTupleToMaybe toMaybe ( a, b ) =
-    toMaybe b |> Maybe.map ((,) a)
+    toMaybe b |> Maybe.map (Tuple.pair a)
 
 
-encodeBench : LowLevel.Benchmark -> Maybe Value
+encodeBench : Benchmark.Benchmark -> Maybe Value
 encodeBench bench =
-    bench
-        |> LowLevel.status
-        |> encodeStats
-        |> Maybe.map
-            (\attrs ->
-                ([ ( "name", LowLevel.name bench |> Json.Encode.string ) ]
-                    ++ attrs
-                )
-                    |> Json.Encode.object
-            )
+    Reporting.fromBenchmark bench
+        |> encodeReport
+        |> Just
 
 
-encodeStats : LowLevel.Status -> Maybe (List ( String, Value ))
-encodeStats status =
+encodeReport : Reporting.Report -> Value
+encodeReport report =
+    case report of
+        Reporting.Single name status ->
+            encodeNameStatus name status
+
+        Reporting.Series name items ->
+            Json.Encode.object
+                [ ( "name", Json.Encode.string name )
+                , ( "series", Json.Encode.list (\( subname, status ) -> encodeNameStatus subname status) items )
+                ]
+
+        Reporting.Group name reports ->
+            Json.Encode.object
+                [ ( "name", Json.Encode.string name )
+                , ( "group", Json.Encode.list encodeReport reports )
+                ]
+
+
+encodeNameStatus : String -> Status.Status -> Value
+encodeNameStatus name status =
+    Json.Encode.object (( "name", Json.Encode.string name ) :: encodeStatus status)
+
+
+encodeStatus : Status.Status -> List ( String, Value )
+encodeStatus status =
     case status of
-        LowLevel.ToSize _ ->
-            Nothing
+        Status.Cold ->
+            []
 
-        LowLevel.Pending _ _ _ ->
-            Nothing
+        Status.Unsized ->
+            []
 
-        LowLevel.Failure e ->
-            [ ( "error", Json.Encode.string <| toString e ) ]
-                |> Just
+        Status.Pending _ _ ->
+            []
 
-        LowLevel.Success runs samples ->
-            [ ( "sampleSize", Json.Encode.int runs )
-            , ( "samples", Json.Encode.list (List.map Json.Encode.float samples) )
+        Status.Failure e ->
+            [ ( "error", encodeError e ) ]
+
+        Status.Success _ trend ->
+            [ ( "runsPerSecond", Json.Encode.int (runsPerSecond trend) )
+            , ( "goodnessOfFit", Json.Encode.float (Trend.goodnessOfFit trend) )
             ]
-                |> Just
 
 
-run : (Value -> Cmd Msg) -> Benchmark -> BenchmarkProgram
+encodeError : Status.Error -> Value
+encodeError e =
+    Json.Encode.string <|
+        case e of
+            Status.MeasurementError Benchmark.LowLevel.StackOverflow ->
+                "The benchmark caused a stack overflow"
+
+            Status.MeasurementError (Benchmark.LowLevel.UnknownError msg) ->
+                "Ran into an unknown error: " ++ msg
+
+            Status.AnalysisError (Trend.Math.NeedMoreValues n) ->
+                "Not enough values, I need at least " ++ String.fromInt n
+
+            Status.AnalysisError Trend.Math.AllZeros ->
+                "The benchmark results are all zero! I can't make a trend out of those."
+
+
+runsPerSecond : Trend Trend.Quick -> Int
+runsPerSecond trend =
+    -- runs per second (= 1000ms)
+    trend
+        |> Trend.line
+        |> (\a -> Trend.predictX a 1000)
+        |> floor
+
+
+run : (Value -> Cmd Msg) -> Benchmark.Benchmark -> BenchmarkProgram
 run emit benchmarks =
-    program
-        { init = init emit benchmarks
+    worker
+        { init = \() -> init emit (fromLowLevel benchmarks)
         , update = update
         , subscriptions = always Sub.none
         }
