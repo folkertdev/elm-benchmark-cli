@@ -28,10 +28,7 @@ fromLowLevel lowlevel =
 
 
 type Benchmark
-    = Compare Benchmark.Benchmark (List Benchmark.Benchmark)
-    | Group String (List Benchmark)
-    | Series String (Dict String Benchmark)
-    | Wrapped String Benchmark.Benchmark
+    = Wrapped String Benchmark.Benchmark
 
 
 isDone : Benchmark -> Bool
@@ -39,17 +36,6 @@ isDone benchmark =
     case benchmark of
         Wrapped _ lowlevel ->
             Benchmark.done lowlevel
-
-        Compare base other ->
-            Benchmark.done base && List.all Benchmark.done other
-
-        Group _ other ->
-            List.all isDone other
-
-        Series _ samples ->
-            samples
-                |> Dict.values
-                |> List.all isDone
 
 
 traverse :
@@ -67,40 +53,6 @@ step structure =
     case structure of
         Wrapped name bench ->
             Task.map (Wrapped name) (Benchmark.step bench)
-
-        Compare baseline cases ->
-            case ( Benchmark.step baseline, traverse Benchmark.step cases ) of
-                ( left, right ) ->
-                    Task.map2 Compare left right
-
-        Group name entries ->
-            Task.map (Group name) (traverse step entries)
-
-        Series name entries ->
-            let
-                tasks =
-                    Dict.toList entries
-                        |> List.map
-                            (\( key, entry ) ->
-                                entry
-                                    |> step
-                                    |> Task.map (Tuple.pair key)
-                            )
-            in
-            case tasks of
-                [] ->
-                    Task.succeed (Series name Dict.empty)
-
-                _ ->
-                    List.foldr
-                        (Task.map2
-                            (\( key, value ) dict ->
-                                Dict.insert key value dict
-                            )
-                        )
-                        (Task.succeed entries)
-                        tasks
-                        |> Task.map (Series name)
 
 
 type alias Model =
@@ -218,14 +170,6 @@ getProgress structure =
         Wrapped _ bench ->
             getProgressLowlevel bench
                 |> statusToStats
-
-        Compare baseLine cases ->
-            List.foldr combine
-                (getProgressLowlevel baseLine |> statusToStats)
-                (List.map (getProgressLowlevel >> statusToStats) cases)
-
-        _ ->
-            Debug.todo "not implemented"
 
 
 
@@ -417,36 +361,28 @@ indent level =
 
 
 makePrettyIntro : Benchmark -> String
-makePrettyIntro =
-    makePrettyIntroLines >> String.join "\n"
+makePrettyIntro (Wrapped _ b) =
+    Reporting.fromBenchmark b
+        |> makePrettyIntroLines
+        |> String.join "\n"
 
 
-makePrettyIntroLines : Benchmark -> List String
+makePrettyIntroLines : Reporting.Report -> List String
 makePrettyIntroLines structure =
     case structure of
-        Wrapped name benchmark ->
+        Reporting.Single name _ ->
             [ name ]
 
-        Compare baseline cases ->
-            "Compare:"
-                :: (("→ " ++ getNameLowlevel baseline) |> indent 1)
-                :: List.map (getNameLowlevel >> (++) "↝ " >> indent 1) cases
-
-        Group thisGroup reports ->
+        Reporting.Group thisGroup reports ->
             ("↳ " ++ thisGroup)
                 :: List.concatMap
                     (makePrettyIntroLines >> List.map (indent 1))
                     reports
 
-        Series name variations ->
+        Reporting.Series name variations ->
             ("Series - " ++ name)
-                :: (Dict.toList variations
-                        |> List.concatMap
-                            (\( subname, variation ) ->
-                                ("Variation: " ++ subname)
-                                    :: (variation |> makePrettyIntroLines |> List.map (indent 1))
-                            )
-                        |> List.map (indent 1)
+                :: (variations
+                        |> List.map (\( subname, _ ) -> indent 1 ("Variation: " ++ subname))
                    )
 
 
@@ -455,45 +391,6 @@ encode benchmark =
     case benchmark of
         Wrapped _ bench ->
             encodeBench bench
-
-        Compare baseline cases ->
-            Maybe.map
-                (\baseObject ->
-                    [ ( "baseline", baseObject )
-                    , ( "cases", Json.Encode.list identity (List.filterMap encodeBench cases) )
-                    ]
-                        |> Json.Encode.object
-                )
-                (encodeBench baseline)
-
-        Group name members ->
-            case List.filterMap encode members of
-                [] ->
-                    Nothing
-
-                encodedMembers ->
-                    [ ( "name", Json.Encode.string name )
-                    , ( "entries", Json.Encode.list identity encodedMembers )
-                    ]
-                        |> Json.Encode.object
-                        |> Just
-
-        Series name variations ->
-            case List.filterMap (mapTupleToMaybe encode) (Dict.toList variations) of
-                [] ->
-                    Nothing
-
-                encodedEntries ->
-                    [ ( "name", Json.Encode.string name )
-                    , ( "variations", Json.Encode.object encodedEntries )
-                    ]
-                        |> Json.Encode.object
-                        |> Just
-
-
-mapTupleToMaybe : (b -> Maybe c) -> ( a, b ) -> Maybe ( a, c )
-mapTupleToMaybe toMaybe ( a, b ) =
-    toMaybe b |> Maybe.map (Tuple.pair a)
 
 
 encodeBench : Benchmark.Benchmark -> Maybe Value
