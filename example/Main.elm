@@ -1,5 +1,6 @@
 port module Main exposing (main)
 
+import Array
 import Benchmark
 import Benchmark.Runner.Node exposing (BenchmarkProgram, run)
 import Json.Encode exposing (Value)
@@ -8,20 +9,30 @@ import Json.Encode exposing (Value)
 main : BenchmarkProgram
 main =
     let
-        reverse =
-            Benchmark.benchmark "String.reverse" (\_ -> String.reverse "foobarbaz")
+        n =
+            1000
 
-        id =
-            Benchmark.benchmark "identity" (\_ -> identity "foobarbaz")
+        list =
+            List.range 0 (n - 1)
 
-        three =
-            Benchmark.compare "foo"
-                "String.reverse"
-                (\_ -> String.reverse "foobarbaz")
-                "identity"
-                (\_ -> identity "foobarbaz")
+        array =
+            Array.initialize n identity
+
+        benchmark =
+            Benchmark.describe "folds"
+                [ Benchmark.compare "foldl"
+                    "List.foldl"
+                    (\_ -> List.foldl (+) 0 list)
+                    "Array.foldl"
+                    (\_ -> Array.foldl (+) 0 array)
+                , Benchmark.compare "foldr"
+                    "List.foldr"
+                    (\_ -> List.foldr (+) 0 list)
+                    "Array.foldr"
+                    (\_ -> Array.foldr (+) 0 array)
+                ]
     in
-    run emit three
+    run emit benchmark
 
 
 port emit : Value -> Cmd msg
