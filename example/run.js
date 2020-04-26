@@ -2,6 +2,34 @@ const Elm = require('./elm.js');
 
 const app = Elm.Elm.Main.init();
 
+function show_result(result) {
+
+    switch (result.tag) {
+        case "single": {
+            console.log(result.name);
+            console.table(result.series, [ "name", "runsPerSecond", "change", "goodnessOfFit" ])
+            break;
+        }
+
+        case "series": {
+            console.log(result.name);
+            console.log(result.pretty);
+            break;
+        }
+
+        case "group": {
+            console.log(result.name);
+            console.log("\n");
+            result.group.forEach(show_result);
+            break;
+        }
+
+        default: {
+            break;
+        }
+    }
+}
+
 app.ports.emit.subscribe(function(v) {
     switch (v.type) {
         case 'start':
@@ -16,7 +44,7 @@ app.ports.emit.subscribe(function(v) {
         case 'done':
             process.stderr.write(v.msg);
             process.stderr.write('\x1B[?25h\n\n');
-            console.log(JSON.stringify(v.data, null, 2));
+            show_result(v.data);
             process.exit(0);
     }
 });

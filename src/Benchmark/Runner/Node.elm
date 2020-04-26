@@ -1,5 +1,6 @@
 module Benchmark.Runner.Node exposing (BenchmarkProgram, run)
 
+import AsciiTable
 import Benchmark exposing (Benchmark)
 import Benchmark.LowLevel
 import Benchmark.Reporting as Reporting
@@ -9,17 +10,26 @@ import Json.Encode exposing (Value)
 import Platform exposing (worker)
 import Process
 import Task exposing (Task)
-import Trend.Linear as Trend exposing (Trend)
+import Trend.Linear as Trend exposing (Quick, Trend)
 import Trend.Math
+
+
+type alias BenchmarkProgram =
+    Program () Model Msg
+
+
+run : (Value -> Cmd Msg) -> Benchmark.Benchmark -> BenchmarkProgram
+run emit benchmark =
+    worker
+        { init = \() -> init emit benchmark
+        , update = update
+        , subscriptions = always Sub.none
+        }
 
 
 type alias Model =
     { emit : Value -> Cmd Msg
     }
-
-
-type alias BenchmarkProgram =
-    Program () Model Msg
 
 
 type Msg
@@ -108,62 +118,6 @@ running benchmark =
         ]
 
 
-progressBar : Int -> Float -> String
-progressBar width progress =
-    let
-        doneWhen =
-            (progress * 8 * toFloat width)
-                |> floor
-
-        toGo =
-            width - ceiling (toFloat doneWhen / 8)
-
-        percentDone : Int
-        percentDone =
-            (progress * toFloat 100)
-                |> floor
-    in
-    String.concat
-        [ "▕"
-        , String.repeat (doneWhen // 8) "█"
-        , block (doneWhen |> modBy 8)
-        , String.repeat toGo "·"
-        , "▏"
-        , String.padLeft 4 ' ' (String.fromInt percentDone ++ "%")
-        ]
-
-
-block : Int -> String
-block i =
-    case i of
-        1 ->
-            "▏"
-
-        2 ->
-            "▎"
-
-        3 ->
-            "▍"
-
-        4 ->
-            "▌"
-
-        5 ->
-            "▋"
-
-        6 ->
-            "▊"
-
-        7 ->
-            "▉"
-
-        8 ->
-            "█"
-
-        _ ->
-            ""
-
-
 done : Benchmark -> Value
 done benchmark =
     let
@@ -236,20 +190,80 @@ encodeReport report =
 
         Reporting.Series name items ->
             Json.Encode.object
-                [ ( "name", Json.Encode.string name )
-                , ( "series", Json.Encode.list (\( subname, status ) -> encodeNameStatus subname status) items )
+                [ ( "tag", Json.Encode.string "series" )
+                , ( "name", Json.Encode.string name )
+                , ( "series", Json.Encode.list encodeSeriesItem (getTrends items) )
+                , ( "pretty", Json.Encode.string (AsciiTable.draw AsciiTable.unicodeSingleLine (toData items)) )
                 ]
 
         Reporting.Group name reports ->
             Json.Encode.object
-                [ ( "name", Json.Encode.string name )
+                [ ( "tag", Json.Encode.string "group" )
+                , ( "name", Json.Encode.string name )
                 , ( "group", Json.Encode.list encodeReport reports )
                 ]
 
 
+encodeSeriesItem : ( String, Trend Quick, String ) -> Value
+encodeSeriesItem ( name, trend, change ) =
+    Json.Encode.object
+        [ ( "tag", Json.Encode.string "single" )
+        , ( "name", Json.Encode.string name )
+        , ( "runsPerSecond", Json.Encode.int (runsPerSecond trend) )
+        , ( "goodnessOfFit", Json.Encode.float (Trend.goodnessOfFit trend) )
+        , ( "change", Json.Encode.string change )
+        ]
+
+
+getTrends : List ( String, Status.Status ) -> List ( String, Trend Quick, String )
+getTrends items =
+    let
+        combine : List (Result x a) -> Result x (List a)
+        combine =
+            List.foldr (Result.map2 (::)) (Ok [])
+
+        combineMap : (a -> Result x b) -> List a -> Result x (List b)
+        combineMap f =
+            -- TODO do this properly!
+            combine << List.map f
+
+        resTrends =
+            combineMap (\( name, status ) -> Result.map (\trend -> ( name, trend )) (getTrend status)) items
+    in
+    case resTrends of
+        Ok ((( _, first ) :: _) as trends) ->
+            List.map (\( name, trend ) -> ( name, trend, percentChange first trend )) trends
+
+        _ ->
+            []
+
+
+getTrend : Status.Status -> Result (Maybe Status.Error) (Trend Trend.Quick)
+getTrend status =
+    case status of
+        Status.Cold ->
+            Err Nothing
+
+        Status.Unsized ->
+            Err Nothing
+
+        Status.Pending _ _ ->
+            Err Nothing
+
+        Status.Failure e ->
+            Err (Just e)
+
+        Status.Success _ trend ->
+            Ok trend
+
+
 encodeNameStatus : String -> Status.Status -> Value
 encodeNameStatus name status =
-    Json.Encode.object (( "name", Json.Encode.string name ) :: encodeStatus status)
+    Json.Encode.object
+        (( "tag", Json.Encode.string "single" )
+            :: ( "name", Json.Encode.string name )
+            :: encodeStatus status
+        )
 
 
 encodeStatus : Status.Status -> List ( String, Value )
@@ -290,6 +304,30 @@ encodeError e =
                 "The benchmark results are all zero! I can't make a trend out of those."
 
 
+
+-- ASCII TABLE
+
+
+toData : List ( String, Status.Status ) -> List ( String, List String )
+toData items =
+    items
+        |> getTrends
+        |> List.map
+            (\( name, trend, change ) ->
+                [ name
+                , String.fromInt (runsPerSecond trend)
+                , change
+                , String.fromFloat (Trend.goodnessOfFit trend)
+                ]
+            )
+        |> AsciiTable.transpose
+        |> List.map2 Tuple.pair [ "name", "runs per second", "change", "goodness of fit" ]
+
+
+
+-- TRENDS
+
+
 runsPerSecond : Trend Trend.Quick -> Int
 runsPerSecond trend =
     -- runs per second (= 1000ms)
@@ -299,10 +337,95 @@ runsPerSecond trend =
         |> floor
 
 
-run : (Value -> Cmd Msg) -> Benchmark.Benchmark -> BenchmarkProgram
-run emit benchmark =
-    worker
-        { init = \() -> init emit benchmark
-        , update = update
-        , subscriptions = always Sub.none
-        }
+percentChange : Trend Quick -> Trend Quick -> String
+percentChange old new =
+    let
+        rps =
+            Trend.line >> (\a -> Trend.predictX a 1000)
+
+        change =
+            (rps new - rps old) / rps old
+
+        sign =
+            if change > 0 then
+                "+"
+
+            else
+                ""
+    in
+    if old == new then
+        "-"
+
+    else
+        percent change
+            |> (++) sign
+
+
+percent : Float -> String
+percent =
+    (*) 10000
+        >> round
+        >> toFloat
+        >> (\a -> a / 100)
+        >> String.fromFloat
+        >> (\a -> a ++ "%")
+
+
+
+-- PROGRESS BAR
+
+
+progressBar : Int -> Float -> String
+progressBar width progress =
+    let
+        doneWhen =
+            (progress * 8 * toFloat width)
+                |> floor
+
+        toGo =
+            width - ceiling (toFloat doneWhen / 8)
+
+        percentDone : Int
+        percentDone =
+            (progress * toFloat 100)
+                |> floor
+    in
+    String.concat
+        [ "▕"
+        , String.repeat (doneWhen // 8) "█"
+        , block (doneWhen |> modBy 8)
+        , String.repeat toGo "·"
+        , "▏"
+        , String.padLeft 4 ' ' (String.fromInt percentDone ++ "%")
+        ]
+
+
+block : Int -> String
+block i =
+    case i of
+        1 ->
+            "▏"
+
+        2 ->
+            "▎"
+
+        3 ->
+            "▍"
+
+        4 ->
+            "▌"
+
+        5 ->
+            "▋"
+
+        6 ->
+            "▊"
+
+        7 ->
+            "▉"
+
+        8 ->
+            "█"
+
+        _ ->
+            ""
